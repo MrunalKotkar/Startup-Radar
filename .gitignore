@@ -1,0 +1,5 @@
+.env
+.git.before-clone/
+__pycache__/
+*.py[cod]
+.DS_Store
