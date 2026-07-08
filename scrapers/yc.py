@@ -127,6 +127,7 @@ def _resolve_website(slug: str) -> str | None:
 
 def scrape_yc(
     filters: list[str] | None = None,
+    limit: int = 20,
     per_industry_limit: int = 15,
     resolve_website: bool = True,
 ) -> list[StartupRecord]:
@@ -135,6 +136,9 @@ def scrape_yc(
 
     filters: YC industry slugs, e.g. ["fintech", "healthcare"]. Defaults to
         DEFAULT_INDUSTRIES (all confirmed valid live).
+    limit: total companies to return across all industries combined. Stops
+        as soon as this is reached, so cost/time stay predictable regardless
+        of how many industries are configured.
     per_industry_limit: cap per industry page -- each page yields up to 50
         companies, but resolving the real website costs one extra Bright
         Data call per company, so this keeps bulk-scrape time/cost sane.
@@ -148,6 +152,9 @@ def scrape_yc(
     records: list[StartupRecord] = []
 
     for industry in industries:
+        if len(records) >= limit:
+            break
+
         try:
             markdown = fetch_markdown(urljoin(YC_BASE, f"/companies/industry/{industry}"))
         except BrightDataError as e:
@@ -156,6 +163,9 @@ def scrape_yc(
 
         companies = _parse_industry_page(markdown)[:per_industry_limit]
         for company in companies:
+            if len(records) >= limit:
+                break
+
             slug = company["slug"]
             if slug in seen_slugs:
                 continue

@@ -34,15 +34,22 @@ def fetch_markdown(url: str, timeout: int = 60) -> str:
             "fill in a real token from https://brightdata.com/cp/setting/users"
         )
 
-    response = requests.post(
-        _API_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_TOKEN}",
-        },
-        json={"zone": _ZONE, "url": url, "format": "raw", "data_format": "markdown"},
-        timeout=timeout,
-    )
+    try:
+        response = requests.post(
+            _API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_TOKEN}",
+            },
+            json={"zone": _ZONE, "url": url, "format": "raw", "data_format": "markdown"},
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        # Network-level failures (timeouts, connection resets, etc.) are just
+        # as common as bad HTTP statuses under real load -- both must degrade
+        # gracefully the same way, not crash the whole scrape run.
+        raise BrightDataError(f"Bright Data request for {url} failed: {e}") from e
+
     if response.status_code != 200:
         raise BrightDataError(
             f"Bright Data request for {url} failed: HTTP {response.status_code} {response.text[:300]}"

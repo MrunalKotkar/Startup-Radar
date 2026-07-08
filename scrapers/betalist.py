@@ -72,16 +72,19 @@ class _BetaListHTMLParser(HTMLParser):
 
 def scrape_betalist(
     max_pages: int = 3,
+    limit: int = 20,
     fetch_markdown: FetchText | None = None,
 ) -> list[StartupRecord]:
     """
     Scrape recent BetaList startups.
 
-    max_pages defaults to 3 per the Person 2 plan. fetch_markdown can be a
-    Bright Data scrape_as_markdown wrapper; direct HTTP is used as a fallback.
+    max_pages defaults to 3 per the Person 2 plan. limit caps the total
+    records returned (each candidate costs an extra detail-page fetch, so
+    this keeps bulk-scrape time bounded regardless of max_pages). fetch_markdown
+    can be a Bright Data scrape_as_markdown wrapper; direct HTTP is used as a fallback.
     """
 
-    if max_pages < 1:
+    if max_pages < 1 or limit < 1:
         return []
 
     fetch = fetch_markdown or _default_fetch_text
@@ -89,6 +92,9 @@ def scrape_betalist(
     seen: set[str] = set()
 
     for page_number in range(1, max_pages + 1):
+        if len(records) >= limit:
+            break
+
         page_url = _page_url(page_number)
         try:
             listing_text = fetch(page_url)
@@ -97,6 +103,9 @@ def scrape_betalist(
 
         candidates = _parse_listing_page(listing_text, page_url)
         for candidate in candidates:
+            if len(records) >= limit:
+                break
+
             key = _normalize_key(candidate.detail_url)
             if key in seen:
                 continue
