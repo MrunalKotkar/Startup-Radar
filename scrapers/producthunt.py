@@ -72,7 +72,7 @@ def _resolve_website(slug: str) -> str | None:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def scrape_producthunt(limit: int = 25, resolve_website: bool = True) -> list[StartupRecord]:
+def scrape_producthunt(limit: int = 20, resolve_website: bool = True) -> list[StartupRecord]:
     """
     Scrape today's/recent Product Hunt launches from the homepage.
 
