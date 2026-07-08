@@ -37,6 +37,13 @@ function topRelevantStartup(items) {
   return [...items].sort((a, b) => scoreStartup(b).score - scoreStartup(a).score || a.name.localeCompare(b.name))[0];
 }
 
+function fetchDetail(startup) {
+  const params = new URLSearchParams({ name: startup.name, website: startup.website });
+  return fetch(`/api/detail?${params}`)
+    .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    .catch(() => buildMockDetail(startup));
+}
+
 function App() {
   const initialStartup = topRelevantStartup(mockStartups);
   const [startups, setStartups] = useState(mockStartups);
@@ -57,8 +64,12 @@ function App() {
         const firstStartup = topRelevantStartup(normalized);
         setStartups(normalized);
         setSelected(firstStartup);
-        setDetail(buildMockDetail(firstStartup));
         setUsingFallback(normalized === mockStartups);
+        setLoadingDetail(true);
+        fetchDetail(firstStartup).then((detailData) => {
+          setDetail(detailData);
+          setLoadingDetail(false);
+        });
       })
       .catch(() => {
         const firstStartup = topRelevantStartup(mockStartups);
@@ -95,10 +106,10 @@ function App() {
   function selectStartup(startup) {
     setSelected(startup);
     setLoadingDetail(true);
-    window.setTimeout(() => {
-      setDetail(buildMockDetail(startup));
+    fetchDetail(startup).then((detailData) => {
+      setDetail(detailData);
       setLoadingDetail(false);
-    }, 520);
+    });
   }
 
   return (

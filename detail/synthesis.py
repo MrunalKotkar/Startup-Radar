@@ -7,6 +7,7 @@ from the Streamlit detail view.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from schema import GithubInfo, StartupDetail
@@ -64,15 +65,19 @@ def get_startup_detail(name: str, website: str) -> StartupDetail:
     """
     clean_name = name.strip() or "Unknown startup"
 
-    try:
-        web_detail = get_web_detail(clean_name, website)
-    except Exception:
-        web_detail = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        web_future = pool.submit(get_web_detail, clean_name, website)
+        github_future = pool.submit(get_github_data, clean_name)
 
-    try:
-        github = get_github_data(clean_name)
-    except Exception:
-        github = _empty_github_info()
+        try:
+            web_detail = web_future.result()
+        except Exception:
+            web_detail = {}
+
+        try:
+            github = github_future.result()
+        except Exception:
+            github = _empty_github_info()
 
     contact = web_detail.get("contact") if isinstance(web_detail, dict) else None
     return {

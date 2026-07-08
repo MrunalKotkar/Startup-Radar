@@ -13,16 +13,26 @@ import html
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
+from dotenv import load_dotenv
+
+load_dotenv()
 
 TIMEOUT_SECONDS = 8
 MAX_PAGE_CHARS = 120_000
 SEARCH_URL = "https://duckduckgo.com/html/"
 BRIGHTDATA_REQUEST_URL = "https://api.brightdata.com/request"
+
+# Shared across calls rather than created per-request: _fetch_text races a
+# direct fetch against Bright Data and often doesn't wait for the losing
+# side, so a fresh ThreadPoolExecutor's context-manager exit (which blocks
+# until every submitted future finishes) would defeat the point.
+_POOL = ThreadPoolExecutor(max_workers=16)
 
 
 def _fallback_detail(name: str) -> dict[str, Any]:
@@ -119,8 +129,27 @@ def _direct_fetch_text(url: str) -> str:
     return _decode_response(raw)
 
 
+def _looks_like_real_page(raw: str) -> bool:
+    return len(raw) > 2000 and bool(re.search(r"<(html|body)[\s>]", raw, re.IGNORECASE))
+
+
 def _fetch_text(url: str) -> str:
-    return _brightdata_request(url, _brightdata_zone("web")) or _direct_fetch_text(url)
+    """Race a direct fetch against Bright Data instead of trying one then
+    the other. Most sites don't need unlocking at all (confirmed live:
+    razorpay.com times out Bright Data's full 8s and returns nothing, while
+    a plain fetch succeeds in ~1s) -- always waiting out that timeout first
+    dominated total detail-synthesis time. Direct fetch wins immediately if
+    it looks like a real page; otherwise fall back to whichever Bright Data
+    call was already running in the background (needed for JS-rendered/
+    bot-protected sites where direct fetch returns an empty app shell)."""
+    direct_future = _POOL.submit(_direct_fetch_text, url)
+    bd_future = _POOL.submit(_brightdata_request, url, _brightdata_zone("web"))
+
+    direct_result = direct_future.result()
+    if _looks_like_real_page(direct_result):
+        return direct_result
+
+    return bd_future.result() or direct_result
 
 
 def _html_to_text(raw: str) -> str:
@@ -199,13 +228,25 @@ def _extract_contact(raw: str, text: str, links: dict[str, str]) -> str | None:
     return links.get("contact")
 
 
+_NAME = r"[A-Z][a-z'-]+(?:\s+[A-Z][a-z'-]+){1,2}"
+_NAME_LIST = rf"{_NAME}(?:\s*(?:,|and|&)\s*{_NAME})*"
+
+# Real bios come in a few shapes: "founded by X and Y", "X, co-founder of...",
+# and -- very common in company blurbs -- "X (CEO & Co-Founder)". The keyword
+# itself needs case-insensitive matching (source text is often "Co-Founder",
+# not "co-founder"), scoped with (?i:...) so it doesn't loosen the name
+# pattern itself (names must still start with a capital letter).
+_FOUNDER_PATTERNS = [
+    rf"(?i:founded by|co-founded by)\s+({_NAME_LIST})",
+    rf"(?i:founders?)[:\s]+({_NAME_LIST})",
+    rf"({_NAME}),?\s+(?:is\s+)?(?:the\s+)?(?i:co-founder|founder)\b",
+    rf"({_NAME})\s*\([^)]*(?i:co-founder|founder)[^)]*\)",
+]
+
+
 def _extract_founders_from_text(text: str, startup_name: str) -> list[str]:
     founders: list[str] = []
-    patterns = [
-        r"(?:founded by|co-founded by|founders?[:\s]+)([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,2}(?:\s*(?:,|and|&)\s*[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,2})*)",
-        r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,2}),?\s+(?:co-)?founder",
-    ]
-    for pattern in patterns:
+    for pattern in _FOUNDER_PATTERNS:
         for match in re.finditer(pattern, text):
             candidate_group = match.group(1)
             for candidate in re.split(r"\s*(?:,| and | & )\s*", candidate_group):
@@ -217,11 +258,21 @@ def _extract_founders_from_text(text: str, startup_name: str) -> list[str]:
     return founders
 
 
+_STOPWORDS = {
+    "the", "he", "she", "they", "it", "this", "that", "also", "and", "or",
+    "but", "his", "her", "their", "our", "your", "its", "who", "which",
+    "about", "contact", "privacy", "terms", "founder", "founders", "ceo",
+    "cto", "coo", "team", "read", "more", "learn",
+}
+
+
 def _looks_like_person_name(candidate: str, startup_name: str) -> bool:
     if not candidate or startup_name.lower() in candidate.lower():
         return False
     words = candidate.split()
     if not 2 <= len(words) <= 3:
+        return False
+    if any(word.lower() in _STOPWORDS for word in words):
         return False
     blocked = {"About Us", "Contact Us", "Privacy Policy", "Terms Service"}
     return candidate not in blocked and all(word[:1].isupper() for word in words)
@@ -233,22 +284,26 @@ def _extract_search_titles_from_json(raw: str) -> list[str]:
     except json.JSONDecodeError:
         return []
 
+    if not isinstance(data, dict):
+        return []
+
+    # Bright Data's brd_json=1 SERP response puts real organic results under
+    # "organic" -- other top-level keys like "navigation" (Google's own tab
+    # labels: "News", "Images", "AI Mode"...) also have "title" fields and
+    # must NOT be treated as search results.
+    organic = data.get("organic")
+    if not isinstance(organic, list):
+        return []
+
     titles: list[str] = []
-
-    def walk(value: Any) -> None:
+    for item in organic:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if isinstance(title, str) and title.strip() and title.strip() not in titles:
+            titles.append(title.strip())
         if len(titles) >= 10:
-            return
-        if isinstance(value, dict):
-            title = value.get("title")
-            if isinstance(title, str) and title.strip() and title.strip() not in titles:
-                titles.append(title.strip())
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(data)
+            break
     return titles
 
 
@@ -294,31 +349,71 @@ def _search(query: str, max_results: int = 3) -> list[str]:
     return _brightdata_search(query, max_results) or _direct_search(query, max_results)
 
 
-def _hiring_signal(name: str, website_text: str, careers_text: str) -> str:
+def _extract_search_descriptions_from_json(raw: str) -> list[str]:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    organic = data.get("organic")
+    if not isinstance(organic, list):
+        return []
+
+    descriptions: list[str] = []
+    for item in organic:
+        if not isinstance(item, dict):
+            continue
+        description = item.get("description")
+        if isinstance(description, str) and description.strip() and description.strip() not in descriptions:
+            descriptions.append(description.strip())
+        if len(descriptions) >= 10:
+            break
+    return descriptions
+
+
+def _search_snippets(query: str, max_results: int = 5) -> list[str]:
+    """Search result descriptions, not titles -- titles rarely contain a
+    founder's name, but the prose snippet underneath often does. Only
+    available via Bright Data's SERP JSON; degrades to [] otherwise, which
+    just means founder lookup falls back to whatever the page text found."""
+    serp_zone = _brightdata_zone("serp")
+    if not serp_zone:
+        return []
+
+    google_url = f"https://www.google.com/search?{urlencode({'q': query, 'brd_json': '1'})}"
+    raw = _brightdata_request(google_url, serp_zone)
+    if not raw:
+        return []
+
+    return _extract_search_descriptions_from_json(raw)[:max_results]
+
+
+def _resolve_hiring_signal(website_text: str, careers_text: str, search_results: list[str]) -> str:
     combined = f"{website_text} {careers_text}".lower()
     if re.search(r"\b(we'?re hiring|join our team|open roles|job openings|careers|hiring)\b", combined):
         return "hiring"
 
-    search_results = " ".join(_search(f"{name} careers hiring jobs", max_results=2)).lower()
-    if re.search(r"\b(careers|jobs|hiring|open roles)\b", search_results):
+    search_text = " ".join(search_results).lower()
+    if re.search(r"\b(careers|jobs|hiring|open roles)\b", search_text):
         return "hiring"
     return "no signal found"
 
 
-def _funding_summary(name: str) -> str:
-    results = _search(f"{name} funding raised", max_results=3)
-    if not results:
+def _resolve_funding_summary(search_results: list[str]) -> str:
+    if not search_results:
         return "no funding information found"
-    return "Funding signal: " + "; ".join(results[:2])
+    return "Funding signal: " + "; ".join(search_results[:2])
 
 
-def _founders(name: str, website_text: str, about_text: str) -> list[str]:
+def _resolve_founders(name: str, website_text: str, about_text: str, search_snippets: list[str]) -> list[str]:
     found = _extract_founders_from_text(f"{about_text} {website_text}", name)
     if found:
         return found
 
-    search_results = _search(f"{name} founder", max_results=3)
-    return _extract_founders_from_text(". ".join(search_results), name)
+    return _extract_founders_from_text(". ".join(search_snippets), name)
 
 
 def get_web_detail(name: str, website: str) -> dict[str, Any]:
@@ -327,6 +422,16 @@ def get_web_detail(name: str, website: str) -> dict[str, Any]:
 
     The returned keys are designed to be consumed by detail.synthesis and
     normalized into schema.StartupDetail.
+
+    Performance note: this used to run every page fetch and every search
+    query one after another (up to 8 sequential network calls, each able to
+    burn a full 8s Bright Data timeout before falling back -- worst case
+    well over a minute). Two fixes: (1) _fetch_text races Bright Data
+    against a direct fetch instead of trying one then the other, since most
+    sites don't need unlocking at all; (2) the four name-only searches don't
+    depend on the homepage, so they're fired off at the same time as the
+    homepage fetch instead of after it -- only the about/contact/careers
+    fetches have to wait, since they need links discovered from the homepage.
     """
     clean_name = name.strip() or "this startup"
     fallback = _fallback_detail(clean_name)
@@ -334,7 +439,13 @@ def get_web_detail(name: str, website: str) -> dict[str, Any]:
     if not base_url:
         return fallback
 
-    raw_home = _fetch_text(base_url)
+    home_future = _POOL.submit(_fetch_text, base_url)
+    news_future = _POOL.submit(_search, f"{clean_name} startup news", 3)
+    hiring_future = _POOL.submit(_search, f"{clean_name} careers hiring jobs", 2)
+    funding_future = _POOL.submit(_search, f"{clean_name} funding raised", 3)
+    founders_future = _POOL.submit(_search_snippets, f"{clean_name} founder", 5)
+
+    raw_home = home_future.result()
     home_text = _html_to_text(raw_home)
     links = _extract_links(raw_home, base_url) if raw_home else {}
 
@@ -342,18 +453,25 @@ def get_web_detail(name: str, website: str) -> dict[str, Any]:
     contact_url = links.get("contact")
     careers_url = links.get("careers") or links.get("jobs")
 
-    about_text = _html_to_text(_fetch_text(about_url)) if about_url else ""
-    contact_raw = _fetch_text(contact_url) if contact_url else ""
-    contact_text = _html_to_text(contact_raw)
-    careers_text = _html_to_text(_fetch_text(careers_url)) if careers_url else ""
+    about_future = _POOL.submit(_fetch_text, about_url) if about_url else None
+    contact_future = _POOL.submit(_fetch_text, contact_url) if contact_url else None
+    careers_future = _POOL.submit(_fetch_text, careers_url) if careers_url else None
 
-    news = _search(f"{clean_name} startup news", max_results=3)
+    contact_raw = contact_future.result() if contact_future else ""
+    about_text = _html_to_text(about_future.result()) if about_future else ""
+    careers_text = _html_to_text(careers_future.result()) if careers_future else ""
+    news = news_future.result()
+    hiring_search_results = hiring_future.result()
+    funding_search_results = funding_future.result()
+    founder_snippets = founders_future.result()
+
+    contact_text = _html_to_text(contact_raw)
 
     return {
         "summary": _summarize_site(clean_name, raw_home, home_text),
         "news": news[:3],
-        "hiring_signal": _hiring_signal(clean_name, home_text, careers_text),
-        "founders": _founders(clean_name, home_text, about_text),
-        "funding_summary": _funding_summary(clean_name),
+        "hiring_signal": _resolve_hiring_signal(home_text, careers_text, hiring_search_results),
+        "founders": _resolve_founders(clean_name, home_text, about_text, founder_snippets),
+        "funding_summary": _resolve_funding_summary(funding_search_results),
         "contact": _extract_contact(f"{raw_home} {contact_raw}", f"{home_text} {contact_text}", links),
     }

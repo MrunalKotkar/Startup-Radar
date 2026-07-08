@@ -71,6 +71,26 @@ _NON_COMPANY_DOMAINS = (
 )
 
 
+def _shorten_one_liner(text: str, max_chars: int = 140) -> str:
+    """Cap YC's description to an actual one-liner.
+
+    YC's directory shows a short tagline for most companies but a full
+    multi-paragraph bio for others (observed: Razorpay, GitLab, etc. --
+    several hundred to 2000+ characters) with no length cap in the source
+    markup itself, so this has to be enforced on our side.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    first_sentence = re.split(r"(?<=[.!?])\s+", text)[0].strip()
+    if len(first_sentence) <= max_chars:
+        return first_sentence
+
+    truncated = text[:max_chars].rsplit(" ", 1)[0].rstrip(",;:. ")
+    return truncated + "…"
+
+
 def _parse_industry_page(markdown: str) -> list[dict]:
     """Split one industry page's markdown into per-company dicts (name, slug, one_liner, tags)."""
     chunks = re.split(r"(?=^\[\]\(/companies/[a-z0-9-]+\)\*)", markdown, flags=re.MULTILINE)
@@ -107,7 +127,7 @@ def _parse_industry_page(markdown: str) -> list[dict]:
                 break
             tags.append(p)
 
-        companies.append({"name": name, "slug": slug, "one_liner": one_liner, "tags": tags})
+        companies.append({"name": name, "slug": slug, "one_liner": _shorten_one_liner(one_liner), "tags": tags})
     return companies
 
 

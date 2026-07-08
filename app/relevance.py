@@ -10,15 +10,19 @@ from __future__ import annotations
 from typing import Any
 
 
+# Derived from actual tag frequency across data/startups.json (top 8 tags
+# covering the widest real spread), not an arbitrary example list -- this
+# is what makes "sort by relevance" produce a meaningful High/Medium/Low
+# mix instead of everything landing on the same bucket.
 SKILL_PROFILE = [
-    "distributed systems",
-    "go",
-    "kafka",
-    "cloud infra",
-    "backend",
-    "aws",
+    "saas",
+    "productivity",
+    "b2b",
+    "api",
+    "fintech",
+    "automation",
     "developer tools",
-    "open source",
+    "artificial intelligence",
 ]
 
 
