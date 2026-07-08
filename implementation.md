@@ -62,19 +62,26 @@ Everything below was checked before writing this plan, so the team isn't buildin
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                DETAIL LAYER (on-demand, live)                  │
-│  1. Bright Data: scrape company website → mission/product       │
-│  2. Bright Data: search_engine("{company} news") → headlines    │
-│  3. Bright Data: search_engine("{company} careers") → hiring     │
-│     signal (soft; fallback if career page is JS-rendered)        │
-│  4. GitHub API: search org/repos → stars, language, open          │
-│     "good first issue" count, last commit                         │
-│  → synthesis step compiles all four into one profile dict          │
+│  1. Bright Data: scrape company website → mission/product        │
+│     + About/Team page → founders + Contact page → contact info    │
+│  2. Bright Data: search_engine("{company} news") → headlines      │
+│  3. Bright Data: search_engine("{company} careers") → hiring       │
+│     signal (soft; fallback if career page is JS-rendered)          │
+│  4. Bright Data: search_engine("{company} funding raised") →        │
+│     funding summary (soft signal)                                    │
+│  5. Bright Data: search_engine("{company} founder") → fallback if     │
+│     no team page exists                                                │
+│  6. GitHub API: search org/repos → stars, language, open                │
+│     "good first issue" count, last commit                                │
+│  → synthesis step compiles all of this into one profile dict              │
+│  Same logic for every startup regardless of source (YC/PH/BetaList)        │
 └───────────────────────────┬────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 DETAIL VIEW (Streamlit panel)                  │
-│  Synthesized summary + news + hiring badge + "Contribute here"   │
+│  Synthesized summary + founders + news + funding + hiring badge  │
+│  + contact info + "Contribute here"                                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,7 +91,7 @@ The two-tier design (cheap bulk scrape for browsing, expensive live synthesis on
 
 ## 4. Shared Data Contract (`schema.py`)
 
-Agree on this as a group in the first 15 minutes, write it as actual code, and treat it as frozen unless the whole team agrees to a change:
+Agree on this as a group in the first 15 minutes, write it as actual code, and treat it as frozen unless the whole team agrees to a change. **Every field here is found the same way regardless of which source the startup came from** — no field is specific to YC, Product Hunt, or BetaList, so the detail logic doesn't need to branch by source:
 
 ```python
 from typing import TypedDict, Optional
@@ -106,12 +113,15 @@ class GithubInfo(TypedDict):
 class StartupDetail(TypedDict):
     name: str
     summary: str                 # synthesized from site scrape
-    news: list[str]              # up to 3 short headline strings
-    hiring_signal: str           # "hiring" | "unclear" | "no signal found"
+    news: list[str]               # up to 3 short headline strings, [] if none found
+    hiring_signal: str              # "hiring" | "unclear" | "no signal found"
+    founders: list[str]              # from About/Team page or search fallback, [] if not listed
+    funding_summary: str               # synthesized from search, "no funding information found" if none
+    contact: Optional[str]              # public contact page URL or general email, None if neither exists
     github: GithubInfo
 ```
 
-If a field can't be found (no news, no GitHub repo, etc.), use `None`/empty list/"no signal found" rather than omitting the field or crashing — every consumer of this data should treat missing info as a normal, expected state.
+If a field can't be found (no news, no GitHub repo, no team page, etc.), use `None`/empty list/the specified "not found" string rather than omitting the field or crashing — every consumer of this data should treat missing info as a normal, expected state, not an error.
 
 ---
 
@@ -150,9 +160,15 @@ startup-radar/
 | YC directory listing | `scrape_as_markdown` (fallback `scrape_as_html`) | Bulk, once | Person 1 |
 | Product Hunt listings | `scrape_as_markdown` (verify structure first — see §1) | Bulk, once | Person 1 |
 | BetaList listings | `scrape_as_markdown` (verify structure first — see §1) | Bulk, once | Person 2 |
-| Company website content | `scrape_as_markdown` | Detail, on click | Person 3 |
+| Company website content | `scrape_as_markdown` — mission/product | Detail, on click | Person 3 |
+| Company About/Team page | `scrape_as_markdown` — founder names, if a team page exists | Detail, on click | Person 3 |
+| Company Contact page | `scrape_as_markdown` — contact URL or general email | Detail, on click | Person 3 |
 | Recent news | `search_engine` | Detail, on click | Person 3 |
 | Hiring signal | `search_engine`, fallback if career page is JS-rendered/Greenhouse-embedded | Detail, on click | Person 3 |
+| Funding signal | `search_engine("{company} funding raised")` | Detail, on click | Person 3 |
+| Founders (fallback) | `search_engine("{company} founder")`, only if no team page was found | Detail, on click | Person 3 |
+
+This is deliberately the same set of calls for every startup no matter which bulk source it came from — nothing here is YC-specific, Product-Hunt-specific, etc.
 
 Demo line worth using: *"Bright Data handles the parts of the web that fight back — bot detection, JS rendering — so the detail view can synthesize fresh instead of relying on a stale cache."*
 
@@ -189,12 +205,15 @@ Demo close: toggle "sort by relevance to me" and show it re-ranking to surface s
 |---|---|---|
 | Name, one-liner, tags | High | Bulk scrape (each source) |
 | Company mission/product description | High | Company site scrape |
+| Contact info (public email/contact page) | High | Company site scrape |
 | Open-source repo + contribution stats | High | GitHub API |
 | Recent news | Medium — varies by company visibility | `search_engine` |
+| Funding signal | Medium — varies by company visibility, no precise amounts guaranteed | `search_engine` |
 | Hiring signal | Medium-low — JS-heavy career pages | `search_engine` fallback |
-| Precise funding amounts | Not reliable — don't promise this | N/A (batch/stage tag as proxy where available) |
+| Founders | Medium-low — many small startups don't publish a team page | Company About/Team page, `search_engine` fallback |
+| Precise funding amounts | Not reliable — don't promise this | N/A (funding_summary is a soft signal, not exact figures) |
 
-Every medium/low field must degrade gracefully in the UI — "no significant recent news found" is a valid state, not a crash.
+Every medium/low field must degrade gracefully in the UI — "no significant recent news found," "no funding information found," and an empty founders list are all valid states, not crashes.
 
 ---
 
@@ -202,7 +221,7 @@ Every medium/low field must degrade gracefully in the UI — "no significant rec
 
 1. **Browse screen** — grid of startup cards (name, one-liner, tags, source badge), filter by tag/source, "sort by relevance to me" toggle
 2. **Click a card** → detail panel loads live with a visible loading state ("fetching live data…")
-3. **Detail panel shows** — synthesized 2-3 sentence summary, recent news snippet(s), hiring status badge, "Contribute here" section with top repo, open good-first-issue count, and a direct link
+3. **Detail panel shows** — synthesized 2-3 sentence summary, founders (if found), recent news snippet(s), funding signal, hiring status badge, contact link, and a "Contribute here" section with top repo, open good-first-issue count, and a direct link
 4. **Closing demo beat** — toggle relevance sort, click into a high-relevance match, show the contribute link: "this is a startup I could start contributing to today"
 
 ---
@@ -229,9 +248,10 @@ Every medium/low field must degrade gracefully in the UI — "no significant rec
 
 ### Person 3 — Detail synthesis + GitHub integration
 **Do:**
-- Write `get_web_detail(name, website) → dict`: Bright Data calls for company site scrape, news search, careers search
+- Write `get_web_detail(name, website) → dict`: Bright Data calls for company site scrape (mission/product), About/Team page (founders), Contact page (contact info), news search, careers search, and funding search
 - Write `get_github_data(name) → GithubInfo`: GitHub API org/repo lookup, stars, language, open good-first-issue count
 - Combine both into `get_startup_detail(name, website) → StartupDetail`
+- Keep every lookup generic — the same function runs for a YC startup, a Product Hunt startup, or any future source, with no source-specific branching
 **Independent of:** everyone — build and test entirely against one hardcoded sample startup (e.g. a well-known company with a public GitHub org, to avoid burning time on an obscure name with no data)
 **Blocks:** Person 4's detail panel needs this function's output shape — already fixed in `schema.py`, so Person 4 can build in parallel without waiting
 
